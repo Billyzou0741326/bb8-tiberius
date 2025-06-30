@@ -5,6 +5,8 @@ pub enum Error {
     Tiberius(#[from] tiberius::error::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Auth(#[from] Box<dyn std::error::Error + Send + 'static>),
 }
 
 /// Implemented for `&str` (ADO-style string) and `tiberius::Config`
@@ -35,6 +37,7 @@ pub struct ConnectionManager {
     modify_tcp_stream: Box<
         dyn Fn(&async_std::net::TcpStream) -> async_std::io::Result<()> + Send + Sync + 'static,
     >,
+    aad_token_provider: Option<Box<dyn AADTokenProvider>>,
     #[cfg(feature = "sql-browser")]
     use_named_connection: bool,
 }
@@ -45,8 +48,9 @@ impl ConnectionManager {
         Self {
             config,
             modify_tcp_stream: Box::new(|tcp_stream| tcp_stream.set_nodelay(true)),
+            aad_token_provider: None,
             #[cfg(feature = "sql-browser")]
-            use_named_connection: false
+            use_named_connection: false,
         }
     }
 
@@ -55,11 +59,27 @@ impl ConnectionManager {
         Ok(config.into_config().map(Self::new)?)
     }
 
+    pub fn with_aad_token_provider<T: AADTokenProvider>(mut self, provider: T) -> Self {
+        self.aad_token_provider = Some(Box::new(provider));
+        self
+    }
+
     #[cfg(feature = "sql-browser")]
     /// Use `tiberius::SqlBrowser::connect_named` to establish the TCP stream
     pub fn using_named_connection(mut self) -> Self {
         self.use_named_connection = true;
         self
+    }
+
+    async fn get_aad_auth_method<T>(&self, provider: &T) -> Result<tiberius::AuthMethod, Error>
+    where
+        T: AADTokenProvider + ?Sized,
+    {
+        let token = match provider.get_aad_token().await {
+            Ok(token) => token,
+            Err(e) => Err(Error::Auth(e))?,
+        };
+        Ok(tiberius::AuthMethod::AADToken(token))
     }
 }
 
@@ -104,13 +124,22 @@ pub mod rt {
 
             (self.modify_tcp_stream)(&tcp)?;
 
-            let client = match Client::connect(self.config.clone(), tcp.compat_write()).await {
+            let mut config = self.config.clone();
+
+            if let Some(aad_token_providere) = &self.aad_token_provider {
+                let auth_method = self
+                    .get_aad_auth_method(aad_token_providere.as_ref())
+                    .await?;
+                config.authentication(auth_method);
+            }
+
+            let client = match Client::connect(config.clone(), tcp.compat_write()).await {
                 // Connection successful.
                 Ok(client) => client,
 
                 // The server wants us to redirect to a different address
                 Err(tiberius::error::Error::Routing { host, port }) => {
-                    let mut config = self.config.clone();
+                    let mut config = config.clone();
 
                     config.host(&host);
                     config.port(port);
@@ -164,13 +193,22 @@ pub mod rt {
 
             (self.modify_tcp_stream)(&tcp)?;
 
-            let client = match Client::connect(self.config.clone(), tcp).await {
+            let mut config = self.config.clone();
+
+            if let Some(aad_token_providere) = &self.aad_token_provider {
+                let auth_method = self
+                    .get_aad_auth_method(aad_token_providere.as_ref())
+                    .await?;
+                config.authentication(auth_method);
+            }
+
+            let client = match Client::connect(config.clone(), tcp).await {
                 // Connection successful.
                 Ok(client) => client,
 
                 // The server wants us to redirect to a different address
                 Err(tiberius::error::Error::Routing { host, port }) => {
-                    let mut config = self.config.clone();
+                    let mut config = config.clone();
 
                     config.host(&host);
                     config.port(port);
@@ -208,4 +246,17 @@ impl bb8::ManageConnection for ConnectionManager {
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
         false
     }
+}
+
+pub trait AADTokenProvider: Send + Sync + 'static {
+    fn get_aad_token(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<String, Box<dyn std::error::Error + Send + 'static>>,
+                > + Send
+                + 'static,
+        >,
+    >;
 }
